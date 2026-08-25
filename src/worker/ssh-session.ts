@@ -23,7 +23,9 @@ import { SSHTransport } from '../ssh/transport';
 import type { Env } from '../types';
 import {
   normalizeTerminalSize,
+  SESSION_RING_BUFFER_MAX_BYTES,
   type SessionKeys,
+  type SSHSessionPolicy,
   SSH_MSG_CHANNEL_CLOSE,
   SSH_MSG_CHANNEL_DATA,
   SSH_MSG_CHANNEL_EOF,
@@ -211,6 +213,7 @@ export class SSHSession {
   private shareAuditStarted = false;
   private shareAuditClosed = false;
   private shareSessionExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  private shareExpiryWarningTimer: ReturnType<typeof setTimeout> | null = null;
   private sftpAuditContext = new Map<string, Record<string, unknown>>();
   private readonly openShellOnAuth: boolean;
   private readonly ownsWebSocket: boolean;
@@ -221,6 +224,11 @@ export class SSHSession {
   private readonly authenticatedPromise: Promise<void>;
   private authenticatedSettled = false;
   private closed = false;
+  private detached: boolean = false;
+  private detachedOutputBuffer: Uint8Array[] = [];
+  private detachedBufferBytes: number = 0;
+  private unadjustedDetachedBytes: number = 0;
+  private static readonly MAX_DETACHED_BUFFER_BYTES = SESSION_RING_BUFFER_MAX_BYTES;
 
   constructor(
     ws: WebSocket,
@@ -1943,13 +1951,19 @@ export class SSHSession {
             await this.onShellReady();
           }
           const outputData = channel.handleChannelData(payload);
-          try {
-            this.ws.send(outputData);
-          } catch (e) {
-            this.sendDebug(() => `Send shell output failed: ${e instanceof Error ? e.message : e}`);
+          if (this.detached) {
+            this.handleDetachedTerminalOutput(outputData, channel);
+          } else {
+            try {
+              this.ws.send(outputData);
+            } catch (e) {
+              this.sendDebug(
+                () => `Send shell output failed: ${e instanceof Error ? e.message : e}`
+              );
+            }
+            this.recordShareTerminalOutput(outputData);
+            this.queueLocalWindowAdjust(outputData.length, channel);
           }
-          this.recordShareTerminalOutput(outputData);
-          this.queueLocalWindowAdjust(outputData.length, channel);
           // Feed terminal context for Agent
           try {
             this.terminalContext.appendOutput(this.textDecoder.decode(outputData));
@@ -1997,15 +2011,19 @@ export class SSHSession {
             payload[offset + 3];
           offset += 4;
           const stderrData = payload.subarray(offset, offset + dataLen);
-          try {
-            this.ws.send(stderrData);
-          } catch (e) {
-            this.sendDebug(
-              () => `Send stderr output failed: ${e instanceof Error ? e.message : e}`
-            );
+          if (this.detached) {
+            this.handleDetachedTerminalOutput(stderrData, channel);
+          } else {
+            try {
+              this.ws.send(stderrData);
+            } catch (e) {
+              this.sendDebug(
+                () => `Send stderr output failed: ${e instanceof Error ? e.message : e}`
+              );
+            }
+            this.recordShareTerminalOutput(stderrData);
+            this.queueLocalWindowAdjust(stderrData.length, channel);
           }
-          this.recordShareTerminalOutput(stderrData);
-          this.queueLocalWindowAdjust(stderrData.length, channel);
         } else {
           // Exec channel extended data (stderr for Agent)
           const execCh = this.activeExecChannels.get(channelID);
@@ -2856,6 +2874,19 @@ export class SSHSession {
         this.close(true);
         return;
       }
+      // 到期前 60s 预警：挂机用户往往无感知，提前明示会话即将结束
+      const expiryWarningLeadMs = 60_000;
+      const emitExpiryWarning = () => {
+        this.sendStatus('分享会话即将结束（剩余不足 1 分钟）', 'share_expiring_warning');
+      };
+      if (remaining > expiryWarningLeadMs) {
+        this.shareExpiryWarningTimer = setTimeout(
+          emitExpiryWarning,
+          remaining - expiryWarningLeadMs
+        );
+      } else {
+        emitExpiryWarning();
+      }
       this.shareSessionExpiryTimer = setTimeout(() => {
         this.sendError('分享会话已达到最长使用时间', 'share_session_expired');
         this.close(true);
@@ -3205,9 +3236,132 @@ export class SSHSession {
     }
   }
 
+  private handleDetachedTerminalOutput(data: Uint8Array, channel: SSHChannel): void {
+    if (this.detachedBufferBytes + data.length <= SSHSession.MAX_DETACHED_BUFFER_BYTES) {
+      this.detachedOutputBuffer.push(data.slice());
+      this.detachedBufferBytes += data.length;
+      this.recordShareTerminalOutput(data);
+      this.queueLocalWindowAdjust(data.length, channel);
+    } else {
+      // 缓冲区达到 128KB：暂停发送 Window Adjust，触发远程进程背压暂停
+      this.unadjustedDetachedBytes += data.length;
+      this.sendDebug('Detached buffer reached 128KB limit; pausing window adjust for backpressure');
+    }
+  }
+
+  public setDetached(detached: boolean): void {
+    if (this.detached === detached) return;
+    this.detached = detached;
+    if (detached && this.config.sessionPolicy?.source === 'share') {
+      void this.writeShareAudit('session.detached', {
+        detachedAt: Date.now(),
+      });
+    }
+  }
+
+  public isDetached(): boolean {
+    return this.detached;
+  }
+
+  public isReady(): boolean {
+    return this.state === 'ready' && !this.closed;
+  }
+
+  /** 分享会话策略（非分享会话返回 null）；供 DO 层在恢复时做过期与绑定校验。 */
+  public getSessionPolicy(): SSHSessionPolicy | null {
+    return this.config.sessionPolicy ?? null;
+  }
+
+  /** 本会话的 SFTP attach URL；断线保持期由 DO 记录并在恢复时回传前端。 */
+  public getSFTPAttachUrl(): string | undefined {
+    return this.sftpAttachUrl;
+  }
+
+  public async reattachWebSocket(
+    newWs: WebSocket,
+    newSize?: TerminalSize | null,
+    credentials?: {
+      resumeToken?: string;
+      sftpAttachUrl?: string;
+      baseline?: { latencyMs: number; colo: string };
+    }
+  ): Promise<void> {
+    this.ws = newWs;
+    this.detached = false;
+
+    // 恢复 SFTP attach URL（若断线期间丢失），保证恢复后可重建 SFTP 数据通道
+    if (credentials?.sftpAttachUrl && !this.sftpAttachUrl) {
+      this.sftpAttachUrl = credentials.sftpAttachUrl;
+    }
+
+    // 1. 下发会话恢复就绪信号（含轮换后的 resume token 与 SFTP attach URL）
+    try {
+      this.ws.send(
+        JSON.stringify({
+          type: 'session_resumed',
+          ...(credentials?.resumeToken ? { resumeToken: credentials.resumeToken } : {}),
+          ...(this.sftpAttachUrl ? { sftpAttachUrl: this.sftpAttachUrl } : {}),
+        })
+      );
+    } catch {
+      /* 新 WebSocket 尚未就绪，忽略 */
+    }
+
+    // 重发双段延迟基线：上游 SSH 连接未重建，原 CF→源站基线仍有效；
+    // 客户端↔CF 段由心跳即时探测补齐
+    if (credentials?.baseline) {
+      try {
+        this.ws.send(
+          JSON.stringify({
+            type: 'rtt',
+            latency: credentials.baseline.latencyMs,
+            colo: credentials.baseline.colo,
+          })
+        );
+      } catch {
+        /* 发送失败忽略 */
+      }
+    }
+
+    // 2. 补发断线期间暂存的输出数据
+    if (this.detachedOutputBuffer.length > 0) {
+      for (const chunk of this.detachedOutputBuffer) {
+        try {
+          this.ws.send(chunk);
+        } catch {
+          /* 发送失败不中断补发流程 */
+        }
+      }
+      this.detachedOutputBuffer = [];
+      this.detachedBufferBytes = 0;
+    }
+
+    // 3. 恢复因背压积压的 Window 额度
+    if (this.unadjustedDetachedBytes > 0 && this.shellChannel) {
+      this.queueLocalWindowAdjust(this.unadjustedDetachedBytes, this.shellChannel);
+      this.unadjustedDetachedBytes = 0;
+    }
+
+    // 4. 同步最新终端视口尺寸
+    if (newSize && this.shellChannel) {
+      await this.handleResize(newSize.cols, newSize.rows).catch(() => null);
+    }
+
+    // 5. 记录分享会话审计
+    if (this.config.sessionPolicy?.source === 'share') {
+      void this.writeShareAudit('session.resumed', {
+        resumedAt: Date.now(),
+      });
+    }
+  }
+
   close(normal: boolean = false): void {
     if (this.closed) return;
     this.closed = true;
+    this.detached = false;
+    this.detachedOutputBuffer = [];
+    this.detachedBufferBytes = 0;
+    this.unadjustedDetachedBytes = 0;
     this.notifyShareSessionClosed(normal);
     if (!this.authenticatedSettled) {
       this.authenticatedSettled = true;
@@ -3238,6 +3392,10 @@ export class SSHSession {
     if (this.shareSessionExpiryTimer) {
       clearTimeout(this.shareSessionExpiryTimer);
       this.shareSessionExpiryTimer = null;
+    }
+    if (this.shareExpiryWarningTimer) {
+      clearTimeout(this.shareExpiryWarningTimer);
+      this.shareExpiryWarningTimer = null;
     }
     if (this.shareAuditFlushTimer) {
       clearTimeout(this.shareAuditFlushTimer);
