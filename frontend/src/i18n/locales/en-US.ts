@@ -247,6 +247,18 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'terminal.shareResumeUnsupported':
     'This browser cannot pass device identity verification; auto-resume is unavailable and this shared session has ended',
   'terminal.status.shareExpiringWarning': 'Note: this shared session ends in less than 1 minute',
+  'share.auditExport': 'Export',
+  'share.auditPurge': 'Purge log',
+  'share.auditPurgeTitle': 'Purge audit log',
+  'share.auditPurgeMessage':
+    'This permanently deletes all audit details (including terminal output and operations), keeping only a single tombstone marker. This cannot be undone.',
+  'share.auditPurged': 'Audit log purged',
+  'share.auditCleanupLog': 'Audit purge log',
+  'share.auditPurgeManual': 'Manually purged',
+  'share.auditPurgeAuto': 'Auto-purged after retention',
+  'share.auditRemovalHint':
+    'Purged details cannot be recovered; these entries only record the purge operations.',
+  'share.auditPurgeFailed': 'Failed to purge audit log',
   'terminal.shareResumeEnded':
     'Connection lost and could not be resumed. This shared session has ended.',
   'terminal.hostKeyChangeTitle': 'SSH host fingerprint changed',
@@ -487,6 +499,8 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'share.linkExpiry': 'Claim window',
   'share.sessionDuration': 'Maximum session duration',
   'share.minutes': 'minutes',
+  'share.auditRetention': 'Audit retention',
+  'share.days': 'days',
   'share.createWarning':
     'A share link is a temporary access credential. The recipient receives a full terminal and SFTP; send it only through a trusted channel. Every host fingerprint in the route must already be verified.',
   'share.create': 'Create share',

@@ -413,14 +413,24 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
       );
     }
     if (request.method === 'POST') {
-      const body = await request.json<{ expiresInMinutes?: number; maxSessionMinutes?: number }>();
+      const body = await request.json<{
+        expiresInMinutes?: number;
+        maxSessionMinutes?: number;
+        auditRetentionDays?: number;
+      }>();
       const expiresInMinutes = Number(body.expiresInMinutes);
       const maxSessionMinutes = Number(body.maxSessionMinutes);
+      // 审计保留天数：缺省 90；白名单与前端选项一致
+      const auditRetentionDays =
+        body.auditRetentionDays === undefined ? 90 : Number(body.auditRetentionDays);
       if (![5, 15, 30, 60].includes(expiresInMinutes)) {
         return Response.json({ error: 'Invalid share expiry' }, { status: 400 });
       }
       if (![15, 30, 60, 120].includes(maxSessionMinutes)) {
         return Response.json({ error: 'Invalid maximum session duration' }, { status: 400 });
+      }
+      if (![7, 30, 90, 180, 365].includes(auditRetentionDays)) {
+        return Response.json({ error: 'Invalid audit retention' }, { status: 400 });
       }
 
       const token = createShareToken();
@@ -461,6 +471,7 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
             serverName: metadata.serverName,
             expiresAt,
             maxSessionSeconds: maxSessionMinutes * 60,
+            auditRetentionDays,
           }),
         })
       );
@@ -864,7 +875,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
     return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
   }
 
-  const sessionName = `session:${Date.now()}:${Math.random()}`;
+  const sessionName = `session:${Date.now()}:${crypto.randomUUID()}`;
   const doId = env.SSH_SESSION.idFromName(sessionName);
   // 匿名路径不做自动推断（Worker 在 upgrade 时拿不到 host）；
   // 仅尊重用户通过前端下拉手动传入的 ?region= 覆盖值
@@ -1001,6 +1012,15 @@ async function handleShareOwnerRoute(request: Request, url: URL, env: Env): Prom
       )
     );
   }
+  if (url.pathname.endsWith('/audit') && request.method === 'DELETE') {
+    return shareStub.fetch(
+      new Request('http://internal/internal/audit/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerUserId: user.id }),
+      })
+    );
+  }
   if (!url.pathname.endsWith('/audit') && request.method === 'DELETE') {
     return shareStub.fetch(new Request('http://internal/internal/revoke', { method: 'POST' }));
   }
@@ -1126,7 +1146,7 @@ async function handleTokenSSHConnection(
     );
   }
 
-  const sessionName = `session:${Date.now()}:${Math.random()}`;
+  const sessionName = `session:${Date.now()}:${crypto.randomUUID()}`;
   const doId = env.SSH_SESSION.idFromName(sessionName);
   // Token 路径：locationHint 由 user-db.handleConnectServer 按最外层直连节点计算并写入 config
   // （优先级：入口服务器手动 region → 入口 DB 持久化 inferred_hint → undefined）

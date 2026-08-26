@@ -16,6 +16,9 @@ interface ShareSummary {
   activeAt: number | null;
   closedAt: number | null;
   createdAt: number;
+  /** 审计明细被清理的时间与方式；NULL 表示审计仍在，可查看 */
+  auditPurgedAt?: number | null;
+  auditPurgeType?: 'manual' | 'auto' | null;
 }
 
 interface AuditEvent {
@@ -52,7 +55,10 @@ function formatShareStatus(status: string | undefined): string {
 
 function stripTerminalControls(value: string): string {
   return value
+    // 本函数的目的即去除 ANSI 控制序列（OSC \x1b]... / CSI \x1b[...），正则中的控制字符为设计意图。
+    // pi-lens-ignore: lint/suspicious/noControlCharactersInRegex
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    // pi-lens-ignore: lint/suspicious/noControlCharactersInRegex
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
     .replace(/\r/g, '');
 }
@@ -102,6 +108,13 @@ export class ShareManager {
               <option value="60" selected>60 ${t('share.minutes')}</option><option value="120">120 ${t('share.minutes')}</option>
             </select>
           </label>
+          <label class="text-xs text-muted">${t('share.auditRetention')}
+            <select id="share-audit-retention" class="terminal-input w-full mt-1">
+              <option value="7">7 ${t('share.days')}</option><option value="30">30 ${t('share.days')}</option>
+              <option value="90" selected>90 ${t('share.days')}</option><option value="180">180 ${t('share.days')}</option>
+              <option value="365">365 ${t('share.days')}</option>
+            </select>
+          </label>
         </div>
         <p class="text-[11px] text-muted mb-4">${t('share.createWarning')}</p>
         <button id="share-create-btn" type="button" class="cyber-button text-primary px-4 py-2 text-xs font-bold flex items-center gap-2">
@@ -141,12 +154,15 @@ export class ShareManager {
     const maxSessionMinutes = Number(
       (document.getElementById('share-session-duration') as HTMLSelectElement).value
     );
+    const auditRetentionDays = Number(
+      (document.getElementById('share-audit-retention') as HTMLSelectElement).value
+    );
     if (button) button.disabled = true;
     try {
       const response = await fetch(`/api/servers/${this.serverId}/shares`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ expiresInMinutes, maxSessionMinutes }),
+        body: JSON.stringify({ expiresInMinutes, maxSessionMinutes, auditRetentionDays }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         url?: string;
@@ -199,11 +215,29 @@ export class ShareManager {
         container.innerHTML = `<p class="text-xs text-muted">${t('share.none')}</p>`;
         return;
       }
+      const purged = shares.filter((s) => s.auditPurgedAt);
+      // 已清理审计的分享等同删除效果：不再渲染卡片，仅在下方清理留痕区留一条记录
+      const visible = shares.filter((s) => !s.auditPurgedAt);
+      // 集中式清理留痕区：所有已清理的分享都汇总在这里（默认收起）
+      const cleanupSection =
+        purged.length > 0
+          ? `<details class="mb-3 border border-[var(--border)] p-2">
+              <summary class="text-[10px] text-muted cursor-pointer select-none">
+                ${t('share.auditCleanupLog')}（${purged.length}）
+              </summary>
+              <div class="space-y-1 mt-2">
+                ${purged.map((share) => `<div class="text-[10px] text-muted"><span class="text-dim">${escapeHtml(formatTime(share.auditPurgedAt ?? null))}</span> ${escapeHtml(t(`share.status.${share.status}` as never))} · ${share.auditPurgeType === 'auto' ? t('share.auditPurgeAuto') : t('share.auditPurgeManual')}</div>`).join('')}
+              </div>
+              <p class="text-[10px] text-dim mt-1">${t('share.auditRemovalHint')}</p>
+            </details>`
+          : '';
       // pi-lens-ignore: no-inner-html
-      container.innerHTML = shares
-        .map((share) => {
-          const revocable = ['unused', 'claimed', 'active'].includes(share.status);
-          return `<div class="border border-[var(--border)] p-3" data-share-id="${escapeHtml(share.id)}">
+      container.innerHTML =
+        cleanupSection +
+        visible
+          .map((share) => {
+            const revocable = ['unused', 'claimed', 'active'].includes(share.status);
+            return `<div class="border border-[var(--border)] p-3" data-share-id="${escapeHtml(share.id)}">
           <div class="flex items-center justify-between gap-3">
             <div class="min-w-0">
               <div class="text-xs text-on-surface">${t(`share.status.${share.status}` as never)}</div>
@@ -216,8 +250,8 @@ export class ShareManager {
             </div>
           </div>
         </div>`;
-        })
-        .join('');
+          })
+          .join('');
       for (const button of container.querySelectorAll<HTMLElement>('[data-share-audit]')) {
         const shareId = button.dataset.shareAudit;
         if (!shareId) continue;
@@ -262,30 +296,7 @@ export class ShareManager {
     // pi-lens-ignore: no-inner-html
     view.innerHTML = `<p class="text-xs text-muted">${t('common.loading')}</p>`;
     try {
-      const events: AuditEvent[] = [];
-      let after = 0;
-      let hasMore = true;
-      let share: { status: string; auditBytes: number } | null = null;
-      while (hasMore && events.length < 5000) {
-        const response = await fetch(
-          `/api/shares/${encodeURIComponent(shareId)}/audit?after=${after}&limit=500`
-        );
-        const payload = (await response.json().catch(() => ({}))) as {
-          share?: { status: string; auditBytes: number };
-          events?: AuditEvent[];
-          hasMore?: boolean;
-          nextAfter?: number;
-          error?: string;
-        };
-        if (!response.ok || !payload.share || !payload.events)
-          throw new Error(payload.error || t('share.auditFailed'));
-        share = payload.share;
-        events.push(...payload.events);
-        hasMore = payload.hasMore === true;
-        const next = payload.nextAfter ?? after;
-        if (next <= after) break;
-        after = next;
-      }
+      const { share, events } = await this.fetchAllAudit(shareId);
       const output = stripTerminalControls(
         events
           .filter((event) => event.eventType === 'terminal.output')
@@ -293,21 +304,131 @@ export class ShareManager {
           .join('')
       );
       const structured = events.filter((event) => event.eventType !== 'terminal.output');
+      const canPurge =
+        share?.status === 'closed' || share?.status === 'revoked' || share?.status === 'expired';
       // pi-lens-ignore: no-inner-html
       view.innerHTML = `
         <div class="flex items-center justify-between mb-3">
           <h3 class="text-xs font-bold text-primary">${t('share.auditTitle')}</h3>
-          <span class="text-[10px] text-muted">${formatShareStatus(share?.status)} · ${Math.ceil((share?.auditBytes || 0) / 1024)} KiB</span>
+          <div class="flex items-center gap-2">
+            <span class="text-[10px] text-muted">${formatShareStatus(share?.status)} · ${Math.ceil((share?.auditBytes || 0) / 1024)} KiB</span>
+            <button type="button" data-audit-export class="cyber-button px-2 py-1 text-[10px]">${t('share.auditExport')}</button>
+            ${canPurge ? `<button type="button" data-audit-purge class="cyber-button px-2 py-1 text-[10px] text-error">${t('share.auditPurge')}</button>` : ''}
+          </div>
         </div>
         <div class="space-y-1 mb-4 max-h-48 overflow-y-auto custom-scrollbar">
-          ${structured.length ? structured.map((event) => `<div class="text-[10px] text-muted"><span class="text-dim">${escapeHtml(formatTime(event.occurredAt))}</span> ${escapeHtml(this.describeEvent(event))}</div>`).join('') : `<p class="text-xs text-muted">${t('share.auditNone')}</p>`}
+          ${structured.map((event) => `<div class="text-[10px] text-muted"><span class="text-dim">${escapeHtml(formatTime(event.occurredAt))}</span> ${escapeHtml(this.describeEvent(event))}</div>`).join('') || `<p class="text-xs text-muted">${t('share.auditNone')}</p>`}
         </div>
         <h4 class="text-[11px] font-bold text-primary mb-2">${t('share.terminalRecord')}</h4>
         <pre class="bg-[var(--bg)] border border-[var(--border)] p-3 text-[11px] text-on-surface whitespace-pre-wrap break-words max-h-72 overflow-auto custom-scrollbar">${escapeHtml(output || t('share.noTerminalOutput'))}</pre>
       `;
+      for (const button of view.querySelectorAll<HTMLElement>('[data-audit-export]')) {
+        button.addEventListener('click', () => void this.exportAudit(shareId));
+      }
+      for (const button of view.querySelectorAll<HTMLElement>('[data-audit-purge]')) {
+        button.addEventListener('click', () => void this.purgeAudit(shareId));
+      }
     } catch (error) {
       // pi-lens-ignore: no-inner-html
       view.innerHTML = `<p class="text-xs text-error">${escapeHtml(error instanceof Error ? error.message : t('share.auditFailed'))}</p>`;
+    }
+  }
+
+  /** 拉取指定分享的全部审计事件、清理记录与元信息（分页聚合）。 */
+  private async fetchAllAudit(shareId: string): Promise<{
+    share: { status: string; auditBytes: number } | null;
+    events: AuditEvent[];
+    removals: Array<{ occurredAt: number; eventType: string }>;
+  }> {
+    const events: AuditEvent[] = [];
+    let removals: Array<{ occurredAt: number; eventType: string }> = [];
+    let share: { status: string; auditBytes: number } | null = null;
+    let after = 0;
+    let hasMore = true;
+    while (hasMore && events.length < 5000) {
+      const response = await fetch(
+        `/api/shares/${encodeURIComponent(shareId)}/audit?after=${after}&limit=500`
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        share?: { status: string; auditBytes: number };
+        events?: AuditEvent[];
+        removals?: Array<{ occurredAt: number; eventType: string }>;
+        hasMore?: boolean;
+        nextAfter?: number;
+        error?: string;
+      };
+      if (!response.ok || !payload.share || !payload.events)
+        throw new Error(localizedApiError(payload, 'share.auditFailed'));
+      share = { status: payload.share.status, auditBytes: payload.share.auditBytes };
+      events.push(...payload.events);
+      // 清理记录每页都全量返回，直接覆盖避免重复累积
+      if (payload.removals) removals = payload.removals;
+      hasMore = payload.hasMore === true;
+      const next = payload.nextAfter ?? after;
+      if (next <= after) break;
+      after = next;
+    }
+    return { share, events, removals };
+  }
+
+  /** 导出全部审计事件为 JSON 归档（含生命周期与终端输出原文）。 */
+  private async exportAudit(shareId: string): Promise<void> {
+    try {
+      const { share, events, removals } = await this.fetchAllAudit(shareId);
+      const payload = {
+        app: 'CloudSSH',
+        kind: 'share-audit-export',
+        exportedAt: new Date().toISOString(),
+        shareId,
+        status: share?.status ?? null,
+        auditBytes: share?.auditBytes ?? 0,
+        events,
+        auditRemovals: removals,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `cloudssh-share-audit-${shareId}-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      notify(t('share.auditFailed'), { variant: 'danger' });
+    }
+  }
+
+  /** 清空终态会话的全部审计明细（服务端写入墓碑，不可恢复）。 */
+  private async purgeAudit(shareId: string): Promise<void> {
+    const confirmed = await confirmAction({
+      title: t('share.auditPurgeTitle'),
+      message: t('share.auditPurgeMessage'),
+      confirmText: t('share.auditPurge'),
+      cancelText: t('common.cancel'),
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    try {
+      const response = await fetch(`/api/shares/${encodeURIComponent(shareId)}/audit`, {
+        method: 'DELETE',
+      });
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) throw new Error(localizedApiError(payload, 'share.auditPurgeFailed'));
+      notify(t('share.auditPurged'), { variant: 'success' });
+      // 清理等同删除效果：立即收起审计视图并刷新列表，隐藏该分享的查看入口
+      const view = document.getElementById('share-audit-view');
+      if (view) {
+        view.classList.add('hidden');
+        view.innerHTML = '';
+      }
+      await this.loadShares();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : t('share.auditPurgeFailed'), {
+        variant: 'danger',
+      });
     }
   }
 
@@ -323,5 +444,10 @@ export class ShareManager {
       return `SFTP ${operation}${path ? ` ${path}` : ''} · ${result}`;
     }
     return t(`share.event.${event.eventType}` as never);
+    // 注意：share.event.share.audit_purged / audit_auto_purged 两条墓碑词条已移除——
+    // 新版后端 ownerView 已把两类墓碑事件从事件列表过滤（removals 单独返回），
+    // 正常路径不会命中；且前后端同源内联原子部署（build-html → 同一 Worker），
+    // 不存在“新前端调用旧后端”的窗口。如未来启用渐近发布等新旧 Worker 共存
+    // 方案，再按需补回词条。
   }
 }

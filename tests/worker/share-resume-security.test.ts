@@ -10,8 +10,8 @@ const globalShim = globalThis as any;
 if (!globalShim.__cloudsshWsTestShimInstalled) {
   globalShim.__cloudsshWsTestShimInstalled = true;
 
-  if (typeof globalThis.WebSocketPair === 'undefined') {
-    globalThis.WebSocketPair = class {
+  if (typeof (globalThis as any).WebSocketPair === 'undefined') {
+    (globalThis as any).WebSocketPair = class {
       0: any;
       1: any;
       constructor() {
@@ -29,7 +29,8 @@ if (!globalShim.__cloudsshWsTestShimInstalled) {
   const OriginalResponse = globalThis.Response;
   class MockResponse extends OriginalResponse {
     private _mockStatus: number;
-    public webSocket?: any;
+    // 基类 Response 要求 webSocket 为必填只读属性；此 Mock 在 101 升级时赋值。
+    public webSocket: any;
 
     constructor(body?: any, init?: any) {
       if (init && init.status === 101) {
@@ -70,7 +71,9 @@ async function makeDeviceKeyPair(): Promise<DeviceKeyPair> {
     'sign',
     'verify',
   ])) as CryptoKeyPair;
-  const spki = new Uint8Array(await crypto.subtle.exportKey('spki', kp.publicKey));
+  const spki = new Uint8Array(
+    (await crypto.subtle.exportKey('spki', kp.publicKey)) as ArrayBuffer
+  );
   return { privateKey: kp.privateKey as CryptoKey, publicKeyB64: toBase64Url(spki) };
 }
 
