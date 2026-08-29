@@ -1,6 +1,6 @@
 {
   "name": "cloudssh",
-  "version": "1.13.1",
+  "version": "1.14.0",
   "packageManager": "pnpm@11.8.0",
   "description": "纯 Cloudflare 架构 Web SSH 工具",
   "main": "src/worker/index.ts",
@@ -40,6 +40,6 @@
     "@vitest/coverage-v8": "4.1.10",
     "typescript": "^5.7.0",
     "vitest": "4.1.10",
-    "wrangler": "^4.106.0"
+    "wrangler": "^4.125.0"
   }
 }
